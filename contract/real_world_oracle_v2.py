@@ -27,6 +27,7 @@ Lifecycle:  PROPOSED -> RESOLVED -> (DISPUTED -> RESOLVED again) -> FINALIZED
 """
 
 from genlayer import *
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ ZERO_ADDRESS = Address("0x0000000000000000000000000000000000000000")
 
 
 @allow_storage
+@dataclass
 class Question:
     asker: Address
     text: str
