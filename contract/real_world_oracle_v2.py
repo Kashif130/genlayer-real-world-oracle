@@ -28,6 +28,7 @@ Lifecycle:  PROPOSED -> RESOLVED -> (DISPUTED -> RESOLVED again) -> FINALIZED
 
 from genlayer import *
 from dataclasses import dataclass
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +138,11 @@ class RealWorldOracle(gl.Contract):
         criteria = q.criteria
         source_hint = q.source_hint
 
-        def get_verdict() -> dict:
+        def get_verdict() -> str:
             # Non-deterministic block: any web/LLM calls happen here, in a
             # closure that takes no external arguments (GenVM isolation
-            # rule for non-deterministic execution).
+            # rule for non-deterministic execution). Must return a plain
+            # string — eq_principle.prompt_non_comparative asserts on that.
             context = ""
             if source_hint:
                 try:
@@ -166,9 +168,9 @@ class RealWorldOracle(gl.Contract):
                 '"confidence": "high|medium|low", '
                 '"reasoning": "<one or two sentences justifying the answer against the criteria>"}'
             )
-            return gl.nondet.exec_prompt(prompt, response_format="json")
+            return gl.nondet.exec_prompt(prompt)
 
-        verdict = gl.eq_principle.prompt_non_comparative(
+        raw = gl.eq_principle.prompt_non_comparative(
             get_verdict,
             task="Resolve a real-world factual question for an on-chain oracle.",
             criteria=(
@@ -181,14 +183,21 @@ class RealWorldOracle(gl.Contract):
             ),
         )
 
-        if isinstance(verdict, dict):
-            answer = str(verdict.get("answer", "")).strip()
-            confidence = str(verdict.get("confidence", "medium")).strip().lower()
-            reasoning = str(verdict.get("reasoning", "")).strip()
-        else:
-            answer = str(verdict).strip()[:200]
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:]
+                cleaned = cleaned.strip()
+            parsed = json.loads(cleaned)
+            answer = str(parsed.get("answer", "")).strip()
+            confidence = str(parsed.get("confidence", "medium")).strip().lower()
+            reasoning = str(parsed.get("reasoning", "")).strip()
+        except Exception:
+            answer = raw.strip()[:200]
             confidence = "low"
-            reasoning = "Validator response was not structured JSON; raw text stored as answer."
+            reasoning = "Validator response was not valid JSON; raw text stored as answer."
 
         if confidence not in ("high", "medium", "low"):
             confidence = "medium"
