@@ -49,6 +49,7 @@ class Question:
     text: str
     criteria: str
     source_hint: str
+    requires_evidence: bool
     status: u256
     answer: str
     confidence: str
@@ -77,22 +78,46 @@ class RealWorldOracle(gl.Contract):
     # 1. Propose a question
     # -----------------------------------------------------------------
     @gl.public.write
-    def propose_question(self, text: str, criteria: str, source_hint: str) -> None:
+    def propose_question(
+        self,
+        text: str,
+        criteria: str,
+        source_hint: str,
+        requires_evidence: bool = True,
+    ) -> None:
         """
         Register a new question to be resolved by validator consensus.
 
-        text:         the question in plain language, e.g.
-                       "Did the Lahore Qalandars win the 2026 PSL final?"
-        criteria:     how a validator should decide, e.g.
-                       "Answer YES or NO based on the official PSL result."
-        source_hint:  optional URL validators should check first. Pass an
-                       empty string to let each validator rely on its own
-                       research / general knowledge instead.
+        text:               the question in plain language, e.g.
+                             "Did the Lahore Qalandars win the 2026 PSL final?"
+        criteria:           how a validator should decide, e.g.
+                             "Answer YES or NO based on the official PSL result."
+        source_hint:        URL validators should fetch and check. Required
+                             (non-empty) unless requires_evidence is set to
+                             False.
+        requires_evidence:  if True (default), this question can only be
+                             resolved by grounding on fetched source content
+                             — source_hint must be non-empty, and resolution
+                             fails closed (reverts, question stays
+                             PROPOSED/DISPUTED) if the source cannot be
+                             fetched, rather than silently falling back to
+                             the model's own knowledge. Set to False only
+                             for questions that are genuinely not externally
+                             verifiable (pure logic/math, or subjective
+                             judgment calls with no source of truth) — in
+                             that case source_hint may be left empty.
         """
         if len(text.strip()) == 0:
             raise Exception("question text cannot be empty")
         if len(criteria.strip()) == 0:
             raise Exception("resolution criteria cannot be empty")
+        if requires_evidence and len(source_hint.strip()) == 0:
+            raise Exception(
+                "requires_evidence is True but no source_hint was given; "
+                "either provide a URL validators can fetch, or explicitly "
+                "set requires_evidence=False for a non-externally-verifiable "
+                "question"
+            )
 
         qid = self.next_id
         self.next_id = u256(int(self.next_id) + 1)
@@ -102,6 +127,7 @@ class RealWorldOracle(gl.Contract):
             text=text,
             criteria=criteria,
             source_hint=source_hint,
+            requires_evidence=requires_evidence,
             status=u256(STATUS_PROPOSED),
             answer="",
             confidence="",
@@ -137,6 +163,9 @@ class RealWorldOracle(gl.Contract):
         text = q.text
         criteria = q.criteria
         source_hint = q.source_hint
+        requires_evidence = q.requires_evidence
+
+        FETCH_FAILED_SENTINEL = "\u0000FETCH_FAILED\u0000"
 
         def get_verdict() -> str:
             # Non-deterministic block: any web/LLM calls happen here, in a
@@ -144,14 +173,25 @@ class RealWorldOracle(gl.Contract):
             # rule for non-deterministic execution). Must return a plain
             # string — eq_principle.prompt_non_comparative asserts on that.
             context = ""
+            fetch_failed = False
             if source_hint:
                 try:
                     context = gl.nondet.web.get(source_hint)
+                    if not context or not context.strip():
+                        fetch_failed = True
                 except Exception:
-                    context = ""
+                    fetch_failed = True
+
+            if requires_evidence and fetch_failed:
+                # Fail closed: this question was marked as requiring
+                # contract-side evidence, and the source could not be
+                # acquired. Do NOT fall back to the model's own knowledge —
+                # signal failure back to the deterministic caller instead
+                # of guessing.
+                return FETCH_FAILED_SENTINEL
 
             reference = (
-                ("Reference material fetched from the suggested source:\n" + context[:4000])
+                ("Reference material fetched from the required source:\n" + context[:4000])
                 if context
                 else "No source was provided; use your best available knowledge and reasoning."
             )
@@ -179,9 +219,23 @@ class RealWorldOracle(gl.Contract):
                 "'reasoning' differs. Different confidence levels are still "
                 "equivalent as long as the 'answer' field matches. If the "
                 "answer differs in substance (e.g. YES vs NO, or two "
-                "different named outcomes), the verdicts are NOT equivalent."
+                "different named outcomes), the verdicts are NOT equivalent. "
+                "A verdict that is exactly the fetch-failure sentinel is only "
+                "equivalent to another instance of that same sentinel."
             ),
         )
+
+        if requires_evidence and raw.strip() == FETCH_FAILED_SENTINEL:
+            # Evidence was required and validators could not acquire it in
+            # consensus. Leave the question exactly as it was (PROPOSED or
+            # DISPUTED) rather than resolving on a guess — the caller must
+            # retry once the source is reachable, or the question can be
+            # amended. Nothing is written to answer/confidence/reasoning.
+            raise Exception(
+                "could not fetch required source evidence; resolution "
+                "aborted rather than falling back to model knowledge — "
+                "retry once the source URL is reachable"
+            )
 
         try:
             cleaned = raw.strip()
@@ -233,6 +287,35 @@ class RealWorldOracle(gl.Contract):
         q.status = u256(STATUS_DISPUTED)
         q.dispute_bond = u256(int(q.dispute_bond) + int(gl.message.value))
         q.disputer = gl.message.sender_address
+        self.questions[qid] = q
+
+    # -----------------------------------------------------------------
+    # 3b. Recover a stuck evidence-required question with a dead source
+    # -----------------------------------------------------------------
+    @gl.public.write
+    def update_source_hint(self, question_id: int, new_source_hint: str) -> None:
+        """
+        Let the original asker correct source_hint (e.g. a dead/moved URL)
+        so an evidence-required question that keeps failing closed in
+        request_resolution() can be retried against a reachable source,
+        without ever letting resolution silently fall back to the model's
+        own knowledge instead. Only allowed while unresolved/unfinalized —
+        an already-RESOLVED or FINALIZED answer is not affected retroactively.
+        """
+        qid = u256(question_id)
+        q = self.questions.get(qid, None)
+        if q is None:
+            raise Exception("unknown question_id")
+        if gl.message.sender_address != q.asker:
+            raise Exception("only the original asker can update the source hint")
+        if q.status == u256(STATUS_FINALIZED):
+            raise Exception("question already finalized")
+        if q.requires_evidence and len(new_source_hint.strip()) == 0:
+            raise Exception(
+                "this question requires evidence; new_source_hint cannot be empty"
+            )
+
+        q.source_hint = new_source_hint
         self.questions[qid] = q
 
     # -----------------------------------------------------------------
