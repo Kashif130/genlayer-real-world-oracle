@@ -176,7 +176,11 @@ class RealWorldOracle(gl.Contract):
             fetch_failed = False
             if source_hint:
                 try:
-                    context = gl.nondet.web.get(source_hint)
+                    # render(mode='text') returns a plain string, unlike
+                    # web.get() which returns a Response object — using
+                    # the wrong one here silently breaks the empty/failure
+                    # check below (a Response is always truthy).
+                    context = gl.nondet.web.render(source_hint, mode="text")
                     if not context or not context.strip():
                         fetch_failed = True
                 except Exception:
@@ -225,12 +229,15 @@ class RealWorldOracle(gl.Contract):
             ),
         )
 
-        if requires_evidence and raw.strip() == FETCH_FAILED_SENTINEL:
+        if requires_evidence and FETCH_FAILED_SENTINEL in raw:
             # Evidence was required and validators could not acquire it in
             # consensus. Leave the question exactly as it was (PROPOSED or
             # DISPUTED) rather than resolving on a guess — the caller must
             # retry once the source is reachable, or the question can be
             # amended. Nothing is written to answer/confidence/reasoning.
+            # Checked with `in` rather than exact equality since consensus
+            # wrapping/whitespace could otherwise let a failure sentinel
+            # slip past a strict match and get stored as a real answer.
             raise Exception(
                 "could not fetch required source evidence; resolution "
                 "aborted rather than falling back to model knowledge — "
