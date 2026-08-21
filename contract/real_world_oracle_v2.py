@@ -1,4 +1,4 @@
-# v0.2.0
+# v0.3.0
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
 RealWorldOracle — a reusable Intelligent Contract primitive for resolving
@@ -17,17 +17,40 @@ Lifecycle:  PROPOSED -> RESOLVED -> (DISPUTED -> RESOLVED again) -> FINALIZED
    non-deterministic block, reconciled with a *non-comparative* equivalence
    principle: validators are not compared for byte-identical output, they
    are compared for whether their independently-produced verdict agrees on
-   the same underlying answer given the criteria. That is what real-world,
-   ambiguous questions require — a plain strict_eq comparison only works
-   when the underlying fact is already byte-deterministic.
-3. The result is stored and a dispute window opens. Anyone can dispute by
-   staking a bond; a dispute re-triggers resolution as a new round.
-4. Once resolved with no open dispute, the question can be finalized.
-   Finalized answers are immutable and are what dependent contracts read.
+   the same underlying answer given the criteria.
+3. The result is stored and a REAL dispute window opens (wall-clock time,
+   `dispute_window_seconds`, set at deploy time). Anyone can dispute during
+   that window by staking a bond >= min_dispute_bond; a dispute re-triggers
+   resolution as a new round. finalize() is rejected until the window has
+   elapsed, and rejected outright while a dispute is open.
+4. Once resolved, the window has elapsed, and there's no open dispute, the
+   question can be finalized. Finalized answers are immutable and are what
+   dependent contracts read.
+
+v0.3.0 changes (fixes to the challenge lifecycle flagged in review):
+  - finalize() is no longer callable the instant a question is RESOLVED.
+    A real timing guard (`dispute_window_seconds`, wall-clock via
+    datetime.now(), which is deterministic across GenVM validators) must
+    elapse first, giving disputers a genuine window to act in.
+  - A posted dispute bond is no longer silently zeroed out on
+    re-resolution. It is now settled:
+      * dispute upheld (the re-resolved answer differs from the answer
+        that was disputed) -> bond is refunded in full to the disputer
+        via gl.ContractAt(...).emit_transfer(...).
+      * dispute rejected (re-resolved answer matches the disputed one)
+        -> bond is forfeited into `forfeited_bonds`, withdrawable by the
+        contract owner via withdraw_forfeited_bonds(). This is the
+        deterrent against frivolous/spam disputes.
+    Either way the bond amount is accounted for before it's cleared from
+    the question record — nothing just disappears.
+  - Added get_question() view (full record) and a few new views
+    (get_dispute_window_seconds, get_forfeited_bonds, get_resolved_at)
+    needed to inspect/verify the above from outside the contract.
 """
 
 from genlayer import *
 from dataclasses import dataclass
+import datetime
 import json
 
 
@@ -40,6 +63,11 @@ STATUS_DISPUTED = 3
 STATUS_FINALIZED = 4
 
 ZERO_ADDRESS = Address("0x0000000000000000000000000000000000000000")
+
+# Sentinel for "never resolved yet" — a question in PROPOSED status has no
+# real resolved_at, so finalize() (which requires RESOLVED anyway) never
+# reads this meaningfully. Kept timezone-naive to match datetime.now().
+_NEVER_RESOLVED = datetime.datetime.min
 
 
 @allow_storage
@@ -55,6 +83,7 @@ class Question:
     confidence: str
     reasoning: str
     resolved_round: u256
+    resolved_at: datetime.datetime
     dispute_bond: u256
     disputer: Address
     finalized: bool
@@ -64,14 +93,20 @@ class RealWorldOracle(gl.Contract):
     questions: TreeMap[u256, Question]
     next_id: u256
     min_dispute_bond: u256
+    dispute_window_seconds: u256
+    forfeited_bonds: u256
     owner: Address
 
     # -----------------------------------------------------------------
     # Constructor
     # -----------------------------------------------------------------
-    def __init__(self, min_dispute_bond: int):
+    def __init__(self, min_dispute_bond: int, dispute_window_seconds: int):
+        if dispute_window_seconds < 0:
+            raise Exception("dispute_window_seconds cannot be negative")
         self.next_id = u256(0)
         self.min_dispute_bond = u256(min_dispute_bond)
+        self.dispute_window_seconds = u256(dispute_window_seconds)
+        self.forfeited_bonds = u256(0)
         self.owner = gl.message.sender_address
 
     # -----------------------------------------------------------------
@@ -133,6 +168,7 @@ class RealWorldOracle(gl.Contract):
             confidence="",
             reasoning="",
             resolved_round=u256(0),
+            resolved_at=_NEVER_RESOLVED,
             dispute_bond=u256(0),
             disputer=ZERO_ADDRESS,
             finalized=False,
@@ -152,6 +188,9 @@ class RealWorldOracle(gl.Contract):
         a structured verdict. Validators are reconciled with a
         non-comparative equivalence principle: they must independently
         satisfy the same resolution criteria, not produce identical text.
+
+        If this round is re-resolving a DISPUTED question, the posted
+        bond is settled here (see module docstring) before being cleared.
         """
         qid = u256(question_id)
         q = self.questions.get(qid, None)
@@ -234,10 +273,9 @@ class RealWorldOracle(gl.Contract):
             # consensus. Leave the question exactly as it was (PROPOSED or
             # DISPUTED) rather than resolving on a guess — the caller must
             # retry once the source is reachable, or the question can be
-            # amended. Nothing is written to answer/confidence/reasoning.
-            # Checked with `in` rather than exact equality since consensus
-            # wrapping/whitespace could otherwise let a failure sentinel
-            # slip past a strict match and get stored as a real answer.
+            # amended. Nothing is written to answer/confidence/reasoning,
+            # and (important for a DISPUTED question) the bond is left
+            # exactly as posted rather than being touched or cleared.
             raise Exception(
                 "could not fetch required source evidence; resolution "
                 "aborted rather than falling back to model knowledge — "
@@ -263,11 +301,38 @@ class RealWorldOracle(gl.Contract):
         if confidence not in ("high", "medium", "low"):
             confidence = "medium"
 
+        # --- capture pre-overwrite state needed for bond settlement -----
+        was_disputed = q.status == u256(STATUS_DISPUTED)
+        previous_answer = q.answer
+        bond_amount = int(q.dispute_bond)
+        disputer = q.disputer
+
         q.answer = answer
         q.confidence = confidence
         q.reasoning = reasoning[:500]
         q.status = u256(STATUS_RESOLVED)
         q.resolved_round = u256(int(q.resolved_round) + 1)
+        q.resolved_at = datetime.datetime.now()
+
+        # --- settle the dispute bond, if any, BEFORE clearing it --------
+        # Normalized (case/whitespace-insensitive) comparison: the answer
+        # field is specified as a short token (YES/NO/a name/a number), so
+        # this is a safe deterministic proxy for "did the re-resolved
+        # verdict actually change" without recursing into another
+        # non-deterministic equivalence check.
+        if was_disputed and bond_amount > 0 and disputer != ZERO_ADDRESS:
+            dispute_upheld = (
+                answer.strip().upper() != previous_answer.strip().upper()
+            )
+            if dispute_upheld:
+                # Disputer was right to challenge — refund their bond.
+                gl.ContractAt(disputer).emit_transfer(value=u256(bond_amount))
+            else:
+                # Dispute rejected — bond is forfeited as the deterrent
+                # against frivolous challenges. Held by the contract,
+                # withdrawable by the owner via withdraw_forfeited_bonds().
+                self.forfeited_bonds = u256(int(self.forfeited_bonds) + bond_amount)
+
         q.dispute_bond = u256(0)
         q.disputer = ZERO_ADDRESS
         self.questions[qid] = q
@@ -279,8 +344,10 @@ class RealWorldOracle(gl.Contract):
     def dispute_answer(self, question_id: int) -> None:
         """
         Challenge the current answer by staking a bond >= min_dispute_bond.
-        Marks the question DISPUTED; the next request_resolution() call
-        runs a fresh, independent validator round.
+        Only allowed while the dispute window is still open (i.e. before
+        finalize() would be allowed to run). Marks the question DISPUTED;
+        the next request_resolution() call runs a fresh, independent
+        validator round and settles this bond (see module docstring).
         """
         qid = u256(question_id)
         q = self.questions.get(qid, None)
@@ -288,6 +355,11 @@ class RealWorldOracle(gl.Contract):
             raise Exception("unknown question_id")
         if q.status != u256(STATUS_RESOLVED):
             raise Exception("only a RESOLVED question can be disputed")
+        if self._window_elapsed(q):
+            raise Exception(
+                "dispute window has closed for this question; it can only "
+                "be finalized now"
+            )
         if gl.message.value < int(self.min_dispute_bond):
             raise Exception("dispute bond is below the minimum required")
 
@@ -332,7 +404,10 @@ class RealWorldOracle(gl.Contract):
     def finalize(self, question_id: int) -> None:
         """
         Lock in the current answer as immutable. Only allowed from
-        RESOLVED (i.e. no open dispute).
+        RESOLVED (i.e. no open dispute) AND only once the real dispute
+        window (dispute_window_seconds, wall-clock from the moment this
+        round resolved) has actually elapsed. This is the timing/state
+        guard: RESOLVED alone is no longer sufficient to finalize.
         """
         qid = u256(question_id)
         q = self.questions.get(qid, None)
@@ -340,10 +415,52 @@ class RealWorldOracle(gl.Contract):
             raise Exception("unknown question_id")
         if q.status != u256(STATUS_RESOLVED):
             raise Exception("question must be RESOLVED with no open dispute to finalize")
+        if not self._window_elapsed(q):
+            deadline = q.resolved_at + datetime.timedelta(
+                seconds=int(self.dispute_window_seconds)
+            )
+            remaining = (deadline - datetime.datetime.now()).total_seconds()
+            raise Exception(
+                "dispute window still open; "
+                f"{max(int(remaining), 0)} more second(s) before this "
+                "question can be finalized"
+            )
 
         q.status = u256(STATUS_FINALIZED)
         q.finalized = True
         self.questions[qid] = q
+
+    # -----------------------------------------------------------------
+    # 5. Owner — withdraw bonds forfeited by rejected disputes
+    # -----------------------------------------------------------------
+    @gl.public.write
+    def withdraw_forfeited_bonds(self, to: str, amount: int) -> None:
+        """
+        Pay out accumulated forfeited-dispute-bond balance. Owner-only.
+        This is the recovery path for bonds that were forfeited because
+        the dispute they backed was rejected on re-resolution — previously
+        that value had nowhere to go and was just cleared into nothing.
+        """
+        if gl.message.sender_address != self.owner:
+            raise Exception("only the owner can withdraw forfeited bonds")
+        if amount <= 0:
+            raise Exception("amount must be positive")
+        if amount > int(self.forfeited_bonds):
+            raise Exception("amount exceeds available forfeited bond balance")
+
+        self.forfeited_bonds = u256(int(self.forfeited_bonds) - amount)
+        gl.ContractAt(Address(to)).emit_transfer(value=u256(amount))
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+    def _window_elapsed(self, q: Question) -> bool:
+        if q.status != u256(STATUS_RESOLVED):
+            return False
+        deadline = q.resolved_at + datetime.timedelta(
+            seconds=int(self.dispute_window_seconds)
+        )
+        return datetime.datetime.now() >= deadline
 
     # -----------------------------------------------------------------
     # Views
@@ -382,6 +499,45 @@ class RealWorldOracle(gl.Contract):
         if not q.finalized:
             raise Exception("question is not finalized yet")
         return q.answer
+
+    @gl.public.view
+    def get_question(self, question_id: int) -> dict:
+        """Full question record, for UIs/integrators/tests."""
+        q = self.questions.get(u256(question_id), None)
+        if q is None:
+            raise Exception("unknown question_id")
+        return {
+            "asker": str(q.asker),
+            "text": q.text,
+            "criteria": q.criteria,
+            "source_hint": q.source_hint,
+            "requires_evidence": q.requires_evidence,
+            "status": int(q.status),
+            "answer": q.answer,
+            "confidence": q.confidence,
+            "reasoning": q.reasoning,
+            "resolved_round": int(q.resolved_round),
+            "resolved_at": q.resolved_at.isoformat(),
+            "dispute_bond": int(q.dispute_bond),
+            "disputer": str(q.disputer),
+            "finalized": q.finalized,
+        }
+
+    @gl.public.view
+    def can_finalize(self, question_id: int) -> bool:
+        """True iff finalize(question_id) would succeed right now."""
+        q = self.questions.get(u256(question_id), None)
+        if q is None:
+            raise Exception("unknown question_id")
+        return self._window_elapsed(q)
+
+    @gl.public.view
+    def get_dispute_window_seconds(self) -> int:
+        return int(self.dispute_window_seconds)
+
+    @gl.public.view
+    def get_forfeited_bonds(self) -> int:
+        return int(self.forfeited_bonds)
 
     @gl.public.view
     def question_count(self) -> int:
